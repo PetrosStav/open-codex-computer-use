@@ -19,6 +19,7 @@
 - Preserved the selection in focused native edit controls so `ctrl+a` followed by `type_text` replaces dialog text instead of appending to it.
 - Marked navigation and other extended virtual keys with `KEYEVENTF_EXTENDEDKEY`.
 - Documented the foreground behavior and added regression assertions for the embedded runtime.
+- Added a discoverable fork-maintenance guide for safe upstream synchronization, candidate validation, stable binary deployment, and MCP restart behavior.
 
 ### Design Intent (Why)
 `PostMessage` does not update Windows keyboard state, so modifier combinations degrade in applications that query real key state. It can also produce incorrect printable-key behavior in Chromium. `SendInput` follows the normal keyboard pipeline, but it must target the foreground app; thread attachment makes that activation reliable while foreground verification prevents input from reaching the wrong application. Native dialogs disable the process's main window and use a different HWND, so resolving the active same-process window is required before every snapshot and action.
@@ -28,3 +29,6 @@
 - `apps/OpenComputerUseWindows/main.go`
 - `apps/OpenComputerUseWindows/main_test.go`
 - `docs/ARCHITECTURE.md`
+- `docs/WINDOWS_FORK_MAINTENANCE.md`
+- `README.md`
+- `AGENTS.md`

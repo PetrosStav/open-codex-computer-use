@@ -156,6 +156,9 @@ open-computer-use -h
 ocu -h
 ```
 
+For a source-built Windows MCP installed outside npm, follow the
+[custom Windows build maintenance guide](./docs/WINDOWS_FORK_MAINTENANCE.md).
+
 ## Cursor Motion
 
 Cursor Motion is an open-source cursor motion system for macOS, based on public information shared by members of the Software.Inc team. You can download the app from the [Releases page](https://github.com/iFurySt/open-codex-computer-use/releases).
