@@ -239,6 +239,7 @@ $WM_KEYUP = 0x0101
 $WM_CHAR = 0x0102
 $EM_SETSEL = 0x00B1
 $EM_REPLACESEL = 0x00C2
+$BM_CLICK = 0x00F5
 
 function Test-EnvFlagEnabled([string]$name) {
     $value = [Environment]::GetEnvironmentVariable($name)
@@ -547,6 +548,10 @@ function Get-WindowBounds($process, $element) {
     return $null
 }
 
+function Test-NativeButtonClass([string]$className) {
+    return @("Button", "CCPushButton") -contains $className
+}
+
 function Get-PatternNames($element) {
     $names = New-Object System.Collections.Generic.List[string]
     foreach ($pattern in $element.GetSupportedPatterns()) {
@@ -567,6 +572,9 @@ function Get-PatternNames($element) {
         elseif ($programmatic -like "ScrollItemPatternIdentifiers.Pattern") { $names.Add("ScrollIntoView") }
         elseif ($programmatic -like "ScrollPatternIdentifiers.Pattern") { $names.Add("Scroll") }
         elseif ($programmatic -like "ValuePatternIdentifiers.Pattern") { $names.Add("SetValue") }
+    }
+    if ((Test-NativeButtonClass (Get-ElementString $element "ClassName")) -and (Get-ElementInt64 $element "NativeWindowHandle") -gt 0) {
+        $names.Add("Invoke")
     }
     if ($names.Count -gt 0) {
         return @($names | Select-Object -Unique)
@@ -658,16 +666,22 @@ function Get-ElementRecord($element, [int]$index, $windowBounds, $TextLimit = $s
     $frame = Get-ElementFrame $element $windowBounds
     $runtimeId = @()
     try { $runtimeId = @($element.GetRuntimeId()) } catch {}
+    $className = Get-ElementString $element "ClassName"
+    $localizedControlType = Get-ElementString $element "LocalizedControlType"
+    $nativeWindowHandle = Get-ElementInt64 $element "NativeWindowHandle"
+    if ((Test-NativeButtonClass $className) -and $nativeWindowHandle -gt 0 -and $localizedControlType -ieq "pane") {
+        $localizedControlType = "button"
+    }
     [pscustomobject]@{
         index = $index
         runtimeId = $runtimeId
         automationId = Get-ElementString $element "AutomationId"
         name = Limit-Text (Get-ElementString $element "Name") $TextLimit
         controlType = Get-ElementControlTypeName $element
-        localizedControlType = Get-ElementString $element "LocalizedControlType"
-        className = Get-ElementString $element "ClassName"
+        localizedControlType = $localizedControlType
+        className = $className
         value = Get-ElementValue $element $TextLimit
-        nativeWindowHandle = Get-ElementInt64 $element "NativeWindowHandle"
+        nativeWindowHandle = $nativeWindowHandle
         frame = $frame
         actions = @(Get-PatternNames $element)
     }
@@ -906,6 +920,25 @@ function Get-CurrentPatternOrNull($element, $pattern) {
     }
 }
 
+function Invoke-NativeButton($element) {
+    if ($null -eq $element -or -not (Test-NativeButtonClass (Get-ElementString $element "ClassName"))) {
+        return $false
+    }
+    try {
+        if (-not $element.Current.IsEnabled) {
+            return $false
+        }
+    } catch {
+        return $false
+    }
+    $buttonHwnd = Get-NativeWindowHandle $element
+    if ($buttonHwnd -eq [IntPtr]::Zero) {
+        return $false
+    }
+    [void][OCUWin32]::PostMessage($buttonHwnd, $BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero)
+    return $true
+}
+
 function Invoke-PreferredClick($element) {
     $invoke = Get-CurrentPatternOrNull $element ([Windows.Automation.InvokePattern]::Pattern)
     if ($null -ne $invoke) {
@@ -922,7 +955,7 @@ function Invoke-PreferredClick($element) {
         $toggle.Toggle()
         return $true
     }
-    return $false
+    return Invoke-NativeButton $element
 }
 
 function Invoke-SecondaryAction($element, [string]$action) {
@@ -930,6 +963,7 @@ function Invoke-SecondaryAction($element, [string]$action) {
         "invoke" {
             $pattern = Get-CurrentPatternOrNull $element ([Windows.Automation.InvokePattern]::Pattern)
             if ($null -ne $pattern) { $pattern.Invoke(); return }
+            if (Invoke-NativeButton $element) { return }
         }
         "toggle" {
             $pattern = Get-CurrentPatternOrNull $element ([Windows.Automation.TogglePattern]::Pattern)
@@ -1021,6 +1055,16 @@ function Get-NativeWindowHandle($element) {
         return [IntPtr]::Zero
     }
     return [IntPtr]$handle
+}
+
+function Get-ClickWindowHandle($element, [IntPtr]$fallback) {
+    if ($null -ne $element) {
+        $elementHwnd = Get-NativeWindowHandle $element
+        if ($elementHwnd -ne [IntPtr]::Zero) {
+            return $elementHwnd
+        }
+    }
+    return $fallback
 }
 
 function Test-TextWindowHandleCandidate($process, $element) {
@@ -1129,7 +1173,8 @@ try {
                             y = [int][math]::Round($windowBounds.y + [double]$operation.y)
                         }
                     }
-                    Send-MouseClick $hwnd $point.x $point.y $operation.mouse_button ([int]$operation.click_count)
+                    $clickHwnd = Get-ClickWindowHandle $element $hwnd
+                    Send-MouseClick $clickHwnd $point.x $point.y $operation.mouse_button ([int]$operation.click_count)
                 } elseif ($clickMethod -eq "global") {
                     throw "click_method 'global' is not supported on Windows"
                 } elseif ($clickMethod -eq "sky_click") {
@@ -1148,7 +1193,8 @@ try {
                                 y = [int][math]::Round($windowBounds.y + [double]$operation.y)
                             }
                         }
-                        Send-MouseClick $hwnd $point.x $point.y $operation.mouse_button ([int]$operation.click_count)
+                        $clickHwnd = Get-ClickWindowHandle $element $hwnd
+                        Send-MouseClick $clickHwnd $point.x $point.y $operation.mouse_button ([int]$operation.click_count)
                     }
                 } else {
                     throw "Invalid click_method '$clickMethod'"

@@ -311,6 +311,23 @@ func TestWindowsRuntimeTargetsActiveModalWindow(t *testing.T) {
 	}
 }
 
+func TestWindowsRuntimeInvokesNativeDialogButtons(t *testing.T) {
+	for _, fragment := range []string{
+		"$BM_CLICK = 0x00F5",
+		"function Test-NativeButtonClass",
+		`@("Button", "CCPushButton")`,
+		"function Invoke-NativeButton",
+		"PostMessage($buttonHwnd, $BM_CLICK",
+		"return Invoke-NativeButton $element",
+		`$localizedControlType = "button"`,
+		"$clickHwnd = Get-ClickWindowHandle $element $hwnd",
+	} {
+		if !strings.Contains(windowsRuntimeScript, fragment) {
+			t.Fatalf("Windows native button runtime missing %q", fragment)
+		}
+	}
+}
+
 func TestWindowsRuntimePreservesFocusedTextSelection(t *testing.T) {
 	for _, fragment := range []string{
 		"$hasKeyboardFocus = [bool]$element.Current.HasKeyboardFocus",
