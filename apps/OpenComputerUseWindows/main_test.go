@@ -320,10 +320,28 @@ func TestWindowsRuntimeInvokesNativeDialogButtons(t *testing.T) {
 		"PostMessage($buttonHwnd, $BM_CLICK",
 		"return Invoke-NativeButton $element",
 		`$localizedControlType = "button"`,
-		"$clickHwnd = Get-ClickWindowHandle $element $hwnd",
+		"$clickHwnd = Get-ClickWindowHandle $element $operation.element $hwnd",
 	} {
 		if !strings.Contains(windowsRuntimeScript, fragment) {
 			t.Fatalf("Windows native button runtime missing %q", fragment)
+		}
+	}
+}
+
+func TestWindowsRuntimeExposesMsaaDialogNavigation(t *testing.T) {
+	for _, fragment := range []string{
+		"AccessibleObjectFromWindow",
+		"public static object GetAccessibleClient",
+		"function Get-MsaaNavigationChildren",
+		`-ine "SysTreeView32"`,
+		`automationId = "msaa:$($child.hwnd):$($child.childId)"`,
+		`localizedControlType = "tree item"`,
+		"function Invoke-MsaaElement",
+		"accDoDefaultAction",
+		"$handled = Invoke-MsaaElement $operation.element",
+	} {
+		if !strings.Contains(windowsRuntimeScript, fragment) {
+			t.Fatalf("Windows MSAA navigation runtime missing %q", fragment)
 		}
 	}
 }

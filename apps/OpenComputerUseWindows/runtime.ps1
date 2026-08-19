@@ -161,6 +161,24 @@ public static class OCUWin32 {
     [DllImport("user32.dll")]
     public static extern bool IsWindowEnabled(IntPtr hWnd);
 
+    [DllImport("oleacc.dll")]
+    private static extern int AccessibleObjectFromWindow(
+        IntPtr hWnd,
+        uint objectId,
+        ref Guid interfaceId,
+        [MarshalAs(UnmanagedType.Interface)] out object accessible
+    );
+
+    public static object GetAccessibleClient(IntPtr hWnd) {
+        Guid accessibleId = new Guid("618736e0-3c3d-11cf-810c-00aa00389b71");
+        object accessible;
+        int result = AccessibleObjectFromWindow(hWnd, 0xFFFFFFFC, ref accessibleId, out accessible);
+        if (result != 0) {
+            Marshal.ThrowExceptionForHR(result);
+        }
+        return accessible;
+    }
+
     [DllImport("user32.dll")]
     public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
 
@@ -687,6 +705,59 @@ function Get-ElementRecord($element, [int]$index, $windowBounds, $TextLimit = $s
     }
 }
 
+function Get-MsaaNavigationChildren($element, $windowBounds) {
+    if ((Get-ElementString $element "ClassName") -ine "SysTreeView32") {
+        return @()
+    }
+    $hwnd = Get-NativeWindowHandle $element
+    if ($hwnd -eq [IntPtr]::Zero) {
+        return @()
+    }
+
+    try {
+        $accessible = [OCUWin32]::GetAccessibleClient($hwnd)
+        $childCount = [int]$accessible.accChildCount
+        $navigationBounds = $element.Current.BoundingRectangle
+    } catch {
+        return @()
+    }
+
+    $items = New-Object System.Collections.Generic.List[object]
+    for ($childId = 1; $childId -le $childCount; $childId++) {
+        try {
+            $name = [string]$accessible.accName($childId)
+            if ([string]::IsNullOrWhiteSpace($name)) {
+                continue
+            }
+            $left = 0
+            $top = 0
+            $width = 0
+            $height = 0
+            $accessible.accLocation([ref]$left, [ref]$top, [ref]$width, [ref]$height, $childId)
+            if ($width -le 0 -or $height -le 0) {
+                continue
+            }
+            if ($left + $width -le $navigationBounds.Left -or $left -ge $navigationBounds.Right -or
+                $top + $height -le $navigationBounds.Top -or $top -ge $navigationBounds.Bottom) {
+                continue
+            }
+            $frame = if ($null -eq $windowBounds) {
+                New-Frame $left $top $width $height
+            } else {
+                New-Frame ($left - $windowBounds.x) ($top - $windowBounds.y) $width $height
+            }
+            $items.Add([pscustomobject]@{
+                childId = $childId
+                name = ($name -replace "\s+\(pinned\)$", "")
+                hwnd = [int64]$hwnd
+                frame = $frame
+            })
+        } catch {
+        }
+    }
+    return $items.ToArray()
+}
+
 function Get-ElementTitle($record) {
     if (-not [string]::IsNullOrWhiteSpace($record.name)) {
         return $record.name
@@ -704,6 +775,38 @@ function Render-Tree($element, $windowBounds, $TextLimit = $script:DefaultTextLi
     $nextIndex = 0
     $effectiveMaxTreeNodes = if ($MaxTreeNodes -gt 0) { $MaxTreeNodes } else { $script:AccessibilityTreeMaxNodeCount }
     $effectiveMaxTreeDepth = if ($MaxTreeDepth -gt 0) { $MaxTreeDepth } else { $script:AccessibilityTreeMaxDepth }
+
+    function Visit-MsaaNavigationChildren($node, [int]$depth) {
+        if ($script:nextIndex -ge $script:MaxTreeNodes -or $depth -gt $script:MaxTreeDepth) {
+            return
+        }
+        foreach ($child in (Get-MsaaNavigationChildren $node $script:windowBounds)) {
+            if ($script:nextIndex -ge $script:MaxTreeNodes) {
+                return
+            }
+            $index = $script:nextIndex
+            $script:nextIndex++
+            $record = [pscustomobject]@{
+                index = $index
+                runtimeId = @()
+                automationId = "msaa:$($child.hwnd):$($child.childId)"
+                name = Limit-Text $child.name $TextLimit
+                controlType = "ControlType.TreeItem"
+                localizedControlType = "tree item"
+                className = "MSAA:SysTreeView32"
+                value = ""
+                nativeWindowHandle = $child.hwnd
+                frame = $child.frame
+                actions = @("Invoke")
+            }
+            $script:records.Add($record)
+            $frameSegment = ""
+            if ($null -ne $record.frame) {
+                $frameSegment = " Frame: {{x: {0}, y: {1}, width: {2}, height: {3}}}" -f [int][math]::Round($record.frame.x), [int][math]::Round($record.frame.y), [int][math]::Round($record.frame.width), [int][math]::Round($record.frame.height)
+            }
+            $script:lines.Add(("`t" * ($depth + 1)) + "$index tree item $($record.name) Secondary Actions: Invoke$frameSegment")
+        }
+    }
 
     function Visit($node, [int]$depth) {
         if ($script:nextIndex -ge $script:MaxTreeNodes -or $depth -gt $script:MaxTreeDepth) {
@@ -747,6 +850,7 @@ function Render-Tree($element, $windowBounds, $TextLimit = $script:DefaultTextLi
             }
         } catch {
         }
+        Visit-MsaaNavigationChildren $node ($depth + 1)
     }
 
     $script:records = $records
@@ -939,6 +1043,19 @@ function Invoke-NativeButton($element) {
     return $true
 }
 
+function Invoke-MsaaElement($record) {
+    if ($null -eq $record -or [string]$record.automationId -notmatch "^msaa:(\d+):(\d+)$") {
+        return $false
+    }
+    try {
+        $accessible = [OCUWin32]::GetAccessibleClient([IntPtr][int64]$Matches[1])
+        [void]$accessible.accDoDefaultAction([int]$Matches[2])
+        return $true
+    } catch {
+        return $false
+    }
+}
+
 function Invoke-PreferredClick($element) {
     $invoke = Get-CurrentPatternOrNull $element ([Windows.Automation.InvokePattern]::Pattern)
     if ($null -ne $invoke) {
@@ -1057,12 +1174,15 @@ function Get-NativeWindowHandle($element) {
     return [IntPtr]$handle
 }
 
-function Get-ClickWindowHandle($element, [IntPtr]$fallback) {
+function Get-ClickWindowHandle($element, $record, [IntPtr]$fallback) {
     if ($null -ne $element) {
         $elementHwnd = Get-NativeWindowHandle $element
         if ($elementHwnd -ne [IntPtr]::Zero) {
             return $elementHwnd
         }
+    }
+    if ($null -ne $record -and [int64]$record.nativeWindowHandle -gt 0) {
+        return [IntPtr][int64]$record.nativeWindowHandle
     }
     return $fallback
 }
@@ -1157,11 +1277,13 @@ try {
                 if ([string]::IsNullOrWhiteSpace($clickMethod)) { $clickMethod = "auto" }
 
                 if ($clickMethod -eq "accessibility") {
-                    if ($null -eq $element) { throw "click_method 'accessibility' requires element_index" }
                     if ($operation.mouse_button -eq "right" -or $operation.mouse_button -eq "middle") {
                         throw "click_method 'accessibility' does not support mouse_button '$($operation.mouse_button)'"
                     }
-                    if (-not (Invoke-PreferredClick $element)) {
+                    if ($null -eq $element -and -not (Invoke-MsaaElement $operation.element)) {
+                        throw "click_method 'accessibility' requires an actionable element_index"
+                    }
+                    if ($null -ne $element -and -not (Invoke-PreferredClick $element)) {
                         throw "click_method 'accessibility' could not click the requested element"
                     }
                 } elseif ($clickMethod -eq "app_post") {
@@ -1173,7 +1295,7 @@ try {
                             y = [int][math]::Round($windowBounds.y + [double]$operation.y)
                         }
                     }
-                    $clickHwnd = Get-ClickWindowHandle $element $hwnd
+                    $clickHwnd = Get-ClickWindowHandle $element $operation.element $hwnd
                     Send-MouseClick $clickHwnd $point.x $point.y $operation.mouse_button ([int]$operation.click_count)
                 } elseif ($clickMethod -eq "global") {
                     throw "click_method 'global' is not supported on Windows"
@@ -1183,6 +1305,8 @@ try {
                     $handled = $false
                     if ($null -ne $element -and $operation.mouse_button -ne "right" -and $operation.mouse_button -ne "middle") {
                         $handled = Invoke-PreferredClick $element
+                    } elseif ($null -eq $element -and $operation.mouse_button -ne "right" -and $operation.mouse_button -ne "middle") {
+                        $handled = Invoke-MsaaElement $operation.element
                     }
                     if (-not $handled) {
                         if ($null -ne $operation.element -and $null -ne $operation.element.frame) {
@@ -1193,7 +1317,7 @@ try {
                                 y = [int][math]::Round($windowBounds.y + [double]$operation.y)
                             }
                         }
-                        $clickHwnd = Get-ClickWindowHandle $element $hwnd
+                        $clickHwnd = Get-ClickWindowHandle $element $operation.element $hwnd
                         Send-MouseClick $clickHwnd $point.x $point.y $operation.mouse_button ([int]$operation.click_count)
                     }
                 } else {
@@ -1201,6 +1325,9 @@ try {
                 }
             }
             "perform_secondary_action" {
+                if ($null -eq $element -and $operation.action.ToLowerInvariant() -eq "invoke" -and (Invoke-MsaaElement $operation.element)) {
+                    break
+                }
                 if ($null -eq $element) { throw "unknown element_index '$($operation.element.index)'" }
                 Invoke-SecondaryAction $element $operation.action
             }
