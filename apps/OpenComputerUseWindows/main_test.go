@@ -8,8 +8,8 @@ import (
 )
 
 func TestToolDefinitionCount(t *testing.T) {
-	if got := len(toolDefinitions()); got != 9 {
-		t.Fatalf("toolDefinitions() count = %d, want 9", got)
+	if got := len(toolDefinitions()); got != 10 {
+		t.Fatalf("toolDefinitions() count = %d, want 10", got)
 	}
 }
 
@@ -46,10 +46,10 @@ func TestClickMethodSchemaAndParser(t *testing.T) {
 	}
 }
 
-func TestWindowsRejectsUnsupportedGlobalClickBeforeSnapshotLookup(t *testing.T) {
+func TestWindowsAcceptsGlobalClickBeforeSnapshotLookup(t *testing.T) {
 	x, y := 10.0, 20.0
 	result := newService().click("Notepad", "", &x, &y, 1, "left", "global")
-	if !result.IsError || result.Content[0].Text != "click_method 'global' is not supported on Windows" {
+	if !result.IsError || !strings.Contains(result.Content[0].Text, "No app state is available") {
 		t.Fatalf("global click result = %#v", result)
 	}
 }
@@ -59,6 +59,83 @@ func TestWindowsRejectsUnsupportedSkyClickBeforeSnapshotLookup(t *testing.T) {
 	result := newService().click("Notepad", "", &x, &y, 1, "left", "sky_click")
 	if !result.IsError || result.Content[0].Text != "click_method 'sky_click' is not supported on Windows" {
 		t.Fatalf("sky_click result = %#v", result)
+	}
+}
+
+func TestPointerSchemasAndParsers(t *testing.T) {
+	click := findToolDefinition(t, "click")
+	clickProperties := click.InputSchema["properties"].(map[string]any)
+	clickCount := clickProperties["click_count"].(map[string]any)
+	if clickCount["minimum"] != 1 || clickCount["maximum"] != 10 {
+		t.Fatalf("click_count bounds = %#v", clickCount)
+	}
+
+	drag := findToolDefinition(t, "drag")
+	dragProperties := drag.InputSchema["properties"].(map[string]any)
+	path := dragProperties["path"].(map[string]any)
+	if path["type"] != "array" || path["maxItems"] != 128 {
+		t.Fatalf("drag path schema = %#v", path)
+	}
+	pathItems := path["items"].(map[string]any)
+	if got := strings.Join(pathItems["required"].([]string), ","); got != "x,y" {
+		t.Fatalf("drag path required = %q", got)
+	}
+	button := dragProperties["mouse_button"].(map[string]any)
+	if got := strings.Join(button["enum"].([]string), ","); got != "left,right,middle" {
+		t.Fatalf("drag mouse_button enum = %q", got)
+	}
+
+	hover := findToolDefinition(t, "hover")
+	if got := strings.Join(hover.InputSchema["required"].([]string), ","); got != "app" {
+		t.Fatalf("hover required = %q", got)
+	}
+
+	for input, want := range map[string]string{"": "left", " LEFT ": "left", "Right": "right", "MIDDLE": "middle"} {
+		got, err := parseMouseButton(input)
+		if err != nil || got != want {
+			t.Fatalf("parseMouseButton(%q) = %q, %v; want %q", input, got, err, want)
+		}
+	}
+	if _, err := parseMouseButton("back"); err == nil {
+		t.Fatal("parseMouseButton(back) unexpectedly succeeded")
+	}
+}
+
+func TestPointerPathValidationAndSerialization(t *testing.T) {
+	path, err := optionalPointerPath(map[string]any{
+		"path": []any{
+			map[string]any{"x": json.Number("10.5"), "y": json.Number("20")},
+			map[string]any{"x": float64(30), "y": 40},
+		},
+	}, "path")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(path) != 2 || path[0].X != 10.5 || path[0].Y != 20 || path[1].X != 30 || path[1].Y != 40 {
+		t.Fatalf("path = %#v", path)
+	}
+
+	encoded, err := json.Marshal(psRequest{Tool: "drag", Path: path, MouseButton: "right"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(encoded); !strings.Contains(got, `"path":[{"x":10.5,"y":20},{"x":30,"y":40}]`) || !strings.Contains(got, `"mouse_button":"right"`) {
+		t.Fatalf("serialized drag request = %s", got)
+	}
+
+	invalid := []map[string]any{
+		{"path": "not-an-array"},
+		{"path": []any{map[string]any{"x": 1}}},
+		{"path": []any{"not-a-point"}},
+	}
+	for _, args := range invalid {
+		if _, err := optionalPointerPath(args, "path"); err == nil {
+			t.Fatalf("optionalPointerPath(%#v) unexpectedly succeeded", args)
+		}
+	}
+	tooLong := make([]any, 129)
+	if _, err := optionalPointerPath(map[string]any{"path": tooLong}, "path"); err == nil {
+		t.Fatal("129-point path unexpectedly succeeded")
 	}
 }
 
@@ -252,14 +329,14 @@ func TestWindowsRuntimeForegroundActionsRequireOptIn(t *testing.T) {
 	if !strings.Contains(windowsRuntimeScript, "OPEN_COMPUTER_USE_WINDOWS_ALLOW_UIA_TEXT_FALLBACK") {
 		t.Fatal("Windows UIA text fallback must remain opt-in")
 	}
-	if !strings.Contains(serverInstructions, "does not auto-launch apps, perform SetFocus, or use UIA text fallback by default") {
+	if !strings.Contains(serverInstructions, "does not auto-launch apps, perform SetFocus secondary actions, or use UIA text fallback by default") {
 		t.Fatal("MCP instructions must document the Windows background-focus policy")
 	}
-	if !strings.Contains(serverInstructions, "press_key and drag tools are different") {
-		t.Fatal("MCP instructions must document that Windows press_key and drag activate the target app")
+	if !strings.Contains(serverInstructions, "Click and scroll automatically fall back to checked foreground physical input") {
+		t.Fatal("MCP instructions must document automatic physical pointer fallback")
 	}
-	if !strings.Contains(serverInstructions, "drag also moves the real mouse pointer") {
-		t.Fatal("MCP instructions must document the Windows drag pointer side effect")
+	if !strings.Contains(serverInstructions, "Hover, drag, global clicks, and physical scroll fallback move the real pointer") {
+		t.Fatal("MCP instructions must document physical pointer side effects")
 	}
 }
 
@@ -375,7 +452,7 @@ func TestWindowsNavigationKeysUseExtendedKeyFlag(t *testing.T) {
 	}
 }
 
-func TestWindowsDragUsesForegroundSystemInput(t *testing.T) {
+func TestWindowsPointerActionsUseForegroundSystemInput(t *testing.T) {
 	for _, fragment := range []string{
 		"public static extern int SetProcessDpiAwareness",
 		"[OCUWin32]::SetProcessDpiAwareness(2)",
@@ -387,19 +464,39 @@ func TestWindowsDragUsesForegroundSystemInput(t *testing.T) {
 		"GetAncestor(child, 2) != target",
 		"AttachThreadInput(currentThread, childThread, true)",
 		"public static bool IsPointOverWindow",
-		"public static void SendMouseDrag(IntPtr target",
-		"Target app lost foreground or no longer covers the drag start point",
+		"private static void SendMouseButton(uint flags)",
+		"private static void SendMouseWheelInput(uint flags, int data)",
+		"private static void GetMouseButton",
+		`case "right":`,
+		"down = 0x0008",
+		"up = 0x0010",
+		`case "middle":`,
+		"down = 0x0020",
+		"up = 0x0040",
+		"public static void SendMouseMove",
+		"public static void SendMouseClick",
+		"public static void SendMouseWheel",
+		"horizontal ? 0x1000u : 0x0800u",
+		"public static void SendMouseDrag(IntPtr target, int[] coordinates, string button)",
+		"Target app lost foreground or no longer covers the pointer target",
 		"Target app lost foreground during drag",
-		"System.Threading.Thread.Sleep(150)",
-		"System.Threading.Thread.Sleep(75)",
-		"SendMouseButton(LEFTDOWN)",
-		"SendMouseButton(LEFTUP)",
-		"[OCUWin32]::ActivateWindow($hwnd)",
-		"if (-not [OCUWin32]::FocusWindowAtPoint($hwnd, $fromX, $fromY))",
-		"[OCUWin32]::SendMouseDrag($hwnd, $fromX, $fromY, $toX, $toY)",
+		"finally {",
+		"SendMouseButton(up)",
+		"function Initialize-PhysicalPointerTarget",
+		"function Send-PhysicalClick",
+		"function Send-Hover",
+		"function Send-PhysicalScroll",
+		"[OCUWin32]::SendMouseDrag($hwnd, $coordinates, $button)",
+		`$clickMethod -eq "global"`,
+		"Send-PhysicalClick $hwnd",
+		`"hover" {`,
+		"Send-Hover $hwnd",
+		"Send-PhysicalScroll $hwnd",
+		"$localFrame = Get-LocalFrame $element $windowBounds",
+		"foreach ($pathPoint in @($operation.path))",
 	} {
 		if !strings.Contains(windowsRuntimeScript, fragment) {
-			t.Fatalf("Windows physical drag runtime missing %q", fragment)
+			t.Fatalf("Windows physical pointer runtime missing %q", fragment)
 		}
 	}
 
@@ -407,7 +504,7 @@ func TestWindowsDragUsesForegroundSystemInput(t *testing.T) {
 	if start < 0 {
 		t.Fatal("could not locate Send-Drag function")
 	}
-	end := strings.Index(windowsRuntimeScript[start:], "function Send-Scroll")
+	end := strings.Index(windowsRuntimeScript[start:], "function Send-PhysicalScroll")
 	if end < 0 {
 		t.Fatal("could not locate end of Send-Drag function")
 	}

@@ -24,7 +24,7 @@ var clickMethodValues = []string{"auto", "accessibility", "app_post", "sky_click
 //go:embed runtime.ps1
 var windowsRuntimeScript string
 
-const serverInstructions = "Computer Use tools let you interact with Windows apps by performing UI actions.\n\nBegin by calling `get_app_state` every turn you want to use Computer Use to get the latest state before acting. The available tools are list_apps, get_app_state, click, perform_secondary_action, scroll, drag, type_text, press_key, and set_value.\n\nPrefer element-targeted interactions over coordinate clicks when an index for the targeted element is available. Windows actions target the app's active modal window when one is open, use UI Automation patterns first, and fall back to window messages when an app does not expose the needed pattern. The Windows runtime does not auto-launch apps, perform SetFocus, or use UIA text fallback by default, so background-capable actions do not intentionally steal the user's foreground focus. The press_key and drag tools are different: Windows requires the target app to be foreground for reliable system input, so they activate the app's active window first; drag also moves the real mouse pointer while holding the left button."
+const serverInstructions = "Computer Use tools let you interact with Windows apps by performing UI actions.\n\nBegin by calling `get_app_state` every turn you want to use Computer Use to get the latest state before acting. The available tools are list_apps, get_app_state, click, hover, perform_secondary_action, scroll, drag, type_text, press_key, and set_value.\n\nPrefer element-targeted interactions over coordinates when an index for the target is available. Windows actions target the app's active modal window when one is open and use UI Automation patterns first. Click and scroll automatically fall back to checked foreground physical input when semantic activation is unavailable; app_post remains an explicit background HWND-message mode. Hover, drag, global clicks, and physical scroll fallback move the real pointer and require the target to remain foreground. Drag is atomic, can hold any mouse button, and can follow optional intermediate path points. The runtime releases held buttons on failure and aborts physical input if another app takes foreground. It does not auto-launch apps, perform SetFocus secondary actions, or use UIA text fallback by default."
 
 type toolDefinition struct {
 	Name        string         `json:"name"`
@@ -131,6 +131,11 @@ func (s *appSnapshot) result() toolCallResult {
 	return result
 }
 
+type pointerPoint struct {
+	X float64 `json:"x"`
+	Y float64 `json:"y"`
+}
+
 type psRequest struct {
 	Tool         string         `json:"tool"`
 	App          string         `json:"app,omitempty"`
@@ -141,6 +146,7 @@ type psRequest struct {
 	FromY        *float64       `json:"from_y,omitempty"`
 	ToX          *float64       `json:"to_x,omitempty"`
 	ToY          *float64       `json:"to_y,omitempty"`
+	Path         []pointerPoint `json:"path,omitempty"`
 	ClickCount   int            `json:"click_count,omitempty"`
 	MouseButton  string         `json:"mouse_button,omitempty"`
 	ClickMethod  string         `json:"click_method,omitempty"`
@@ -206,14 +212,36 @@ func (s *service) callTool(name string, args map[string]any) toolCallResult {
 		if err != nil {
 			return textResult(err.Error(), true)
 		}
+		mouseButton, err := parseMouseButton(optionalString(args, "mouse_button"))
+		if err != nil {
+			return textResult(err.Error(), true)
+		}
+		clickCount, err := optionalPositiveInt(args, "click_count")
+		if err != nil {
+			return textResult(err.Error(), true)
+		}
+		count := 1
+		if clickCount != nil {
+			count = *clickCount
+		}
+		if count > 10 {
+			return textResult("click_count must be between 1 and 10", true)
+		}
 		return s.click(
 			requiredString(args, "app"),
 			optionalElementIndex(args),
 			optionalFloat(args, "x"),
 			optionalFloat(args, "y"),
-			intValue(optionalFloat(args, "click_count"), 1),
-			defaultString(optionalString(args, "mouse_button"), "left"),
+			count,
+			mouseButton,
 			clickMethod,
+		)
+	case "hover":
+		return s.hover(
+			requiredString(args, "app"),
+			optionalElementIndex(args),
+			optionalFloat(args, "x"),
+			optionalFloat(args, "y"),
 		)
 	case "perform_secondary_action":
 		return s.performSecondaryAction(
@@ -229,12 +257,22 @@ func (s *service) callTool(name string, args map[string]any) toolCallResult {
 			floatValue(optionalFloat(args, "pages"), 1),
 		)
 	case "drag":
+		mouseButton, err := parseMouseButton(optionalString(args, "mouse_button"))
+		if err != nil {
+			return textResult(err.Error(), true)
+		}
+		path, err := optionalPointerPath(args, "path")
+		if err != nil {
+			return textResult(err.Error(), true)
+		}
 		return s.drag(
 			requiredString(args, "app"),
 			requiredFloat(args, "from_x"),
 			requiredFloat(args, "from_y"),
 			requiredFloat(args, "to_x"),
 			requiredFloat(args, "to_y"),
+			path,
+			mouseButton,
 		)
 	case "type_text":
 		return s.typeText(requiredString(args, "app"), requiredString(args, "text"))
@@ -289,11 +327,14 @@ func (s *service) click(app, elementIndex string, x, y *float64, clickCount int,
 	if elementIndex == "" && (x == nil || y == nil) {
 		return textResult("click requires either element_index or x/y", true)
 	}
+	if elementIndex == "" && (!validCoordinate(x) || !validCoordinate(y)) {
+		return textResult("click coordinates must be finite numbers", true)
+	}
+	if clickCount < 1 || clickCount > 10 {
+		return textResult("click_count must be between 1 and 10", true)
+	}
 	if clickMethod == "accessibility" && elementIndex == "" {
 		return textResult("click_method 'accessibility' requires element_index", true)
-	}
-	if clickMethod == "global" {
-		return textResult("click_method 'global' is not supported on Windows", true)
 	}
 	if clickMethod == "sky_click" {
 		return textResult("click_method 'sky_click' is not supported on Windows", true)
@@ -312,6 +353,31 @@ func (s *service) click(app, elementIndex string, x, y *float64, clickCount int,
 		ClickMethod:  clickMethod,
 		WindowBounds: snapshot.WindowBounds,
 	}
+	if elementIndex != "" {
+		record, err := lookupElement(snapshot, elementIndex)
+		if err != nil {
+			return textResult(err.Error(), true)
+		}
+		request.Element = record
+	}
+	return s.actionResult(app, request)
+}
+
+func (s *service) hover(app, elementIndex string, x, y *float64) toolCallResult {
+	if app == "" {
+		return textResult("Missing required argument: app", true)
+	}
+	if elementIndex == "" && (x == nil || y == nil) {
+		return textResult("hover requires either element_index or x/y", true)
+	}
+	if elementIndex == "" && (!validCoordinate(x) || !validCoordinate(y)) {
+		return textResult("hover coordinates must be finite numbers", true)
+	}
+	snapshot := s.currentSnapshot(app)
+	if snapshot == nil {
+		return textResult("No app state is available for "+app+". Run get_app_state before action tools.", true)
+	}
+	request := psRequest{Tool: "hover", App: app, X: x, Y: y, WindowBounds: snapshot.WindowBounds}
 	if elementIndex != "" {
 		record, err := lookupElement(snapshot, elementIndex)
 		if err != nil {
@@ -354,8 +420,8 @@ func (s *service) scroll(app, direction, elementIndex string, pages float64) too
 	if normalized != "up" && normalized != "down" && normalized != "left" && normalized != "right" {
 		return textResult("Invalid scroll direction: "+direction, true)
 	}
-	if pages <= 0 {
-		return textResult("pages must be > 0", true)
+	if math.IsNaN(pages) || math.IsInf(pages, 0) || pages <= 0 || pages > 100 {
+		return textResult("pages must be > 0 and <= 100", true)
 	}
 	snapshot := s.currentSnapshot(app)
 	if snapshot == nil {
@@ -365,10 +431,10 @@ func (s *service) scroll(app, direction, elementIndex string, pages float64) too
 	if err != nil {
 		return textResult(err.Error(), true)
 	}
-	return s.actionResult(app, psRequest{Tool: "scroll", App: app, Element: record, Direction: normalized, Pages: pages})
+	return s.actionResult(app, psRequest{Tool: "scroll", App: app, Element: record, Direction: normalized, Pages: pages, WindowBounds: snapshot.WindowBounds})
 }
 
-func (s *service) drag(app string, fromX, fromY, toX, toY *float64) toolCallResult {
+func (s *service) drag(app string, fromX, fromY, toX, toY *float64, path []pointerPoint, mouseButton string) toolCallResult {
 	if app == "" {
 		return textResult("Missing required argument: app", true)
 	}
@@ -384,11 +450,16 @@ func (s *service) drag(app string, fromX, fromY, toX, toY *float64) toolCallResu
 	if toY == nil {
 		return textResult("Missing required argument: to_y", true)
 	}
+	for _, coordinate := range []*float64{fromX, fromY, toX, toY} {
+		if !validCoordinate(coordinate) {
+			return textResult("drag coordinates must be finite numbers", true)
+		}
+	}
 	snapshot := s.currentSnapshot(app)
 	if snapshot == nil {
 		return textResult("No app state is available for "+app+". Run get_app_state before action tools.", true)
 	}
-	return s.actionResult(app, psRequest{Tool: "drag", App: app, FromX: fromX, FromY: fromY, ToX: toX, ToY: toY, WindowBounds: snapshot.WindowBounds})
+	return s.actionResult(app, psRequest{Tool: "drag", App: app, FromX: fromX, FromY: fromY, ToX: toX, ToY: toY, Path: path, MouseButton: mouseButton, WindowBounds: snapshot.WindowBounds})
 }
 
 func (s *service) typeText(app, text string) toolCallResult {
@@ -599,6 +670,38 @@ func optionalFloat(args map[string]any, key string) *float64 {
 	return nil
 }
 
+func optionalPointerPath(args map[string]any, key string) ([]pointerPoint, error) {
+	value, ok := args[key]
+	if !ok {
+		return nil, nil
+	}
+	items, ok := value.([]any)
+	if !ok {
+		return nil, fmt.Errorf("%s must be an array of points", key)
+	}
+	if len(items) > 128 {
+		return nil, fmt.Errorf("%s cannot contain more than 128 points", key)
+	}
+	points := make([]pointerPoint, 0, len(items))
+	for index, item := range items {
+		object, ok := item.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("%s[%d] must be an object with x and y", key, index)
+		}
+		x := optionalFloat(object, "x")
+		y := optionalFloat(object, "y")
+		if !validCoordinate(x) || !validCoordinate(y) {
+			return nil, fmt.Errorf("%s[%d] must contain finite x and y numbers", key, index)
+		}
+		points = append(points, pointerPoint{X: *x, Y: *y})
+	}
+	return points, nil
+}
+
+func validCoordinate(value *float64) bool {
+	return value != nil && !math.IsNaN(*value) && !math.IsInf(*value, 0)
+}
+
 func optionalTextLimit(args map[string]any, key string) (*textLimit, error) {
 	value, ok := args[key]
 	if !ok {
@@ -707,6 +810,19 @@ func parseClickMethod(value string) (string, error) {
 	return "", fmt.Errorf("Invalid click_method %q. Expected one of: %s", value, strings.Join(clickMethodValues, ", "))
 }
 
+func parseMouseButton(value string) (string, error) {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	if normalized == "" {
+		return "left", nil
+	}
+	for _, candidate := range []string{"left", "right", "middle"} {
+		if normalized == candidate {
+			return normalized, nil
+		}
+	}
+	return "", fmt.Errorf("Invalid mouse_button %q. Expected one of: left, right, middle", value)
+}
+
 func toolDefinitions() []toolDefinition {
 	return []toolDefinition{
 		{
@@ -718,22 +834,35 @@ func toolDefinitions() []toolDefinition {
 				"element_index": stringProperty("Element index to click"),
 				"x":             numberProperty("X coordinate in screenshot pixel coordinates"),
 				"y":             numberProperty("Y coordinate in screenshot pixel coordinates"),
-				"click_count":   integerProperty("Number of clicks. Defaults to 1"),
+				"click_count":   boundedIntegerProperty("Number of clicks. Defaults to 1", 1, 10),
 				"mouse_button":  enumStringProperty("Mouse button to click. Defaults to left.", []string{"left", "right", "middle"}),
-				"click_method":  enumStringProperty("Click implementation: auto (default), accessibility, app_post, sky_click, or global. Accessibility requires element_index. Windows supports app_post through HWND messages and does not currently support sky_click or global.", clickMethodValues),
+				"click_method":  enumStringProperty("Click implementation: auto (default), accessibility, app_post, sky_click, or global. Accessibility requires element_index. On Windows, auto falls back to foreground physical input and global requests it explicitly; sky_click is unsupported.", clickMethodValues),
 			}, []string{"app"}),
 		},
 		{
 			Name:        "drag",
-			Description: "Drag from one point to another using pixel coordinates. This tool is part of plugin `Computer Use`.",
+			Description: "Perform an atomic foreground drag through optional intermediate path points using physical mouse input. This tool is part of plugin `Computer Use`.",
 			Annotations: defaultAnnotations(),
 			InputSchema: objectSchema(map[string]any{
-				"app":    stringProperty("App name or bundle identifier"),
-				"from_x": numberProperty("Start X coordinate"),
-				"from_y": numberProperty("Start Y coordinate"),
-				"to_x":   numberProperty("End X coordinate"),
-				"to_y":   numberProperty("End Y coordinate"),
+				"app":          stringProperty("App name or bundle identifier"),
+				"from_x":       numberProperty("Start X coordinate"),
+				"from_y":       numberProperty("Start Y coordinate"),
+				"to_x":         numberProperty("End X coordinate"),
+				"to_y":         numberProperty("End Y coordinate"),
+				"path":         pointerPathProperty("Intermediate points visited between the start and end, in order"),
+				"mouse_button": enumStringProperty("Mouse button to hold. Defaults to left.", []string{"left", "right", "middle"}),
 			}, []string{"app", "from_x", "from_y", "to_x", "to_y"}),
+		},
+		{
+			Name:        "hover",
+			Description: "Move the physical pointer over an element or screenshot-relative coordinate without clicking. This tool is part of plugin `Computer Use`.",
+			Annotations: defaultAnnotations(),
+			InputSchema: objectSchema(map[string]any{
+				"app":           stringProperty("App name or bundle identifier"),
+				"element_index": stringProperty("Element index to hover"),
+				"x":             numberProperty("X coordinate in screenshot pixel coordinates"),
+				"y":             numberProperty("Y coordinate in screenshot pixel coordinates"),
+			}, []string{"app"}),
 		},
 		{
 			Name:        "get_app_state",
@@ -779,7 +908,7 @@ func toolDefinitions() []toolDefinition {
 				"app":           stringProperty("App name or bundle identifier"),
 				"direction":     stringProperty("Scroll direction: up, down, left, or right"),
 				"element_index": stringProperty("Element identifier"),
-				"pages":         numberProperty("Number of pages to scroll. Fractional values are supported. Defaults to 1"),
+				"pages":         boundedNumberProperty("Number of pages to scroll. Fractional values are supported. Defaults to 1", 0, 100),
 			}, []string{"app", "element_index", "direction"}),
 		},
 		{
@@ -816,6 +945,18 @@ func objectSchema(properties map[string]any, required []string) map[string]any {
 	return schema
 }
 
+func pointerPathProperty(description string) map[string]any {
+	return map[string]any{
+		"type":        "array",
+		"description": description,
+		"maxItems":    128,
+		"items": objectSchema(map[string]any{
+			"x": numberProperty("X coordinate in screenshot pixel coordinates"),
+			"y": numberProperty("Y coordinate in screenshot pixel coordinates"),
+		}, []string{"x", "y"}),
+	}
+}
+
 func defaultAnnotations() map[string]any {
 	return map[string]any{"destructiveHint": false, "openWorldHint": false}
 }
@@ -838,8 +979,16 @@ func numberProperty(description string) map[string]any {
 	return map[string]any{"type": "number", "description": description}
 }
 
+func boundedNumberProperty(description string, exclusiveMinimum, maximum float64) map[string]any {
+	return map[string]any{"type": "number", "exclusiveMinimum": exclusiveMinimum, "maximum": maximum, "description": description}
+}
+
 func integerProperty(description string) map[string]any {
 	return map[string]any{"type": "integer", "description": description}
+}
+
+func boundedIntegerProperty(description string, minimum, maximum int) map[string]any {
+	return map[string]any{"type": "integer", "minimum": minimum, "maximum": maximum, "description": description}
 }
 
 func positiveIntegerProperty(description string) map[string]any {

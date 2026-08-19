@@ -310,49 +310,151 @@ public static class OCUWin32 {
         }
     }
 
-    public static void SendMouseDrag(IntPtr target, int fromX, int fromY, int toX, int toY) {
-        const uint LEFTDOWN = 0x0002;
-        const uint LEFTUP = 0x0004;
-        double deltaX = toX - fromX;
-        double deltaY = toY - fromY;
-        double distance = Math.Sqrt(deltaX * deltaX + deltaY * deltaY);
-        int steps = Math.Min(240, Math.Max(12, (int)Math.Ceiling(distance / 8.0)));
-        int currentX = fromX;
-        int currentY = fromY;
+    private static void SendMouseWheelInput(uint flags, int data) {
+        INPUT input = new INPUT();
+        input.type = 0;
+        input.union.mi.mouseData = unchecked((uint)data);
+        input.union.mi.dwFlags = flags;
+        INPUT[] inputs = new INPUT[] { input };
+        uint sent = SendInput(1, inputs, Marshal.SizeOf(typeof(INPUT)));
+        if (sent != 1) {
+            throw new System.ComponentModel.Win32Exception(
+                Marshal.GetLastWin32Error(),
+                "SendInput mouse wheel event failed"
+            );
+        }
+    }
 
-        if (!SetCursorPos(fromX, fromY)) {
+    private static void GetMouseButton(string button, out uint down, out uint up, out int virtualKey) {
+        switch (button) {
+            case "right":
+                down = 0x0008;
+                up = 0x0010;
+                virtualKey = 0x02;
+                return;
+            case "middle":
+                down = 0x0020;
+                up = 0x0040;
+                virtualKey = 0x04;
+                return;
+            default:
+                down = 0x0002;
+                up = 0x0004;
+                virtualKey = 0x01;
+                return;
+        }
+    }
+
+    private static void MovePointerToTarget(IntPtr target, int x, int y, int settleMilliseconds) {
+        if (!SetCursorPos(x, y)) {
             throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "SetCursorPos failed");
         }
-        System.Threading.Thread.Sleep(150);
-        if (GetForegroundWindow() != target || !IsPointOverWindow(target, fromX, fromY)) {
-            throw new InvalidOperationException("Target app lost foreground or no longer covers the drag start point");
+        System.Threading.Thread.Sleep(settleMilliseconds);
+        if (GetForegroundWindow() != target || !IsPointOverWindow(target, x, y)) {
+            throw new InvalidOperationException("Target app lost foreground or no longer covers the pointer target");
         }
-        SendMouseButton(LEFTDOWN);
-        try {
+    }
+
+    public static void SendMouseMove(IntPtr target, int x, int y) {
+        MovePointerToTarget(target, x, y, 150);
+    }
+
+    public static void SendMouseClick(IntPtr target, int x, int y, string button, int count) {
+        uint down;
+        uint up;
+        int virtualKey;
+        GetMouseButton(button, out down, out up, out virtualKey);
+        MovePointerToTarget(target, x, y, 150);
+
+        for (int click = 0; click < count; click++) {
+            if (GetForegroundWindow() != target || !IsPointOverWindow(target, x, y)) {
+                throw new InvalidOperationException("Target app lost foreground or no longer covers the click point");
+            }
+            bool buttonDown = false;
+            try {
+                SendMouseButton(down);
+                buttonDown = true;
+                System.Threading.Thread.Sleep(35);
+                if ((GetAsyncKeyState(virtualKey) & 0x8000) == 0) {
+                    throw new InvalidOperationException("Injected mouse button did not enter the down state");
+                }
+            }
+            finally {
+                if (buttonDown) {
+                    SendMouseButton(up);
+                }
+            }
             System.Threading.Thread.Sleep(75);
-            if ((GetAsyncKeyState(0x01) & 0x8000) == 0) {
-                throw new InvalidOperationException("Injected left button did not enter the down state");
+            if (click + 1 < count) {
+                System.Threading.Thread.Sleep(75);
             }
-            if (GetForegroundWindow() != target) {
-                throw new InvalidOperationException("Target app lost foreground during drag");
+        }
+    }
+
+    public static void SendMouseWheel(IntPtr target, int x, int y, int delta, bool horizontal) {
+        MovePointerToTarget(target, x, y, 150);
+        SendMouseWheelInput(horizontal ? 0x1000u : 0x0800u, delta);
+    }
+
+    public static void SendMouseDrag(IntPtr target, int[] coordinates, string button) {
+        if (coordinates == null || coordinates.Length < 4 || coordinates.Length % 2 != 0) {
+            throw new ArgumentException("Drag requires at least two coordinate pairs", "coordinates");
+        }
+
+        uint down;
+        uint up;
+        int virtualKey;
+        GetMouseButton(button, out down, out up, out virtualKey);
+        MovePointerToTarget(target, coordinates[0], coordinates[1], 150);
+
+        double totalDistance = 0;
+        for (int point = 2; point < coordinates.Length; point += 2) {
+            double dx = coordinates[point] - coordinates[point - 2];
+            double dy = coordinates[point + 1] - coordinates[point - 1];
+            totalDistance += Math.Sqrt(dx * dx + dy * dy);
+        }
+        int totalSteps = Math.Min(600, Math.Max(12, (int)Math.Ceiling(totalDistance / 8.0)));
+
+        bool buttonDown = false;
+        try {
+            SendMouseButton(down);
+            buttonDown = true;
+            System.Threading.Thread.Sleep(75);
+            if ((GetAsyncKeyState(virtualKey) & 0x8000) == 0) {
+                throw new InvalidOperationException("Injected mouse button did not enter the down state");
             }
-            for (int i = 1; i <= steps; i++) {
-                if (GetForegroundWindow() != target) {
-                    throw new InvalidOperationException("Target app lost foreground during drag");
+            for (int point = 2; point < coordinates.Length; point += 2) {
+                int fromX = coordinates[point - 2];
+                int fromY = coordinates[point - 1];
+                int toX = coordinates[point];
+                int toY = coordinates[point + 1];
+                double dx = toX - fromX;
+                double dy = toY - fromY;
+                double segmentDistance = Math.Sqrt(dx * dx + dy * dy);
+                int segmentSteps = totalDistance == 0 ? 1 :
+                    Math.Max(1, (int)Math.Round(totalSteps * segmentDistance / totalDistance));
+
+                for (int step = 1; step <= segmentSteps; step++) {
+                    if (GetForegroundWindow() != target) {
+                        throw new InvalidOperationException("Target app lost foreground during drag");
+                    }
+                    int currentX = (int)Math.Round(fromX + dx * step / segmentSteps);
+                    int currentY = (int)Math.Round(fromY + dy * step / segmentSteps);
+                    if (!SetCursorPos(currentX, currentY)) {
+                        throw new System.ComponentModel.Win32Exception(
+                            Marshal.GetLastWin32Error(),
+                            "SetCursorPos failed during drag"
+                        );
+                    }
+                    System.Threading.Thread.Sleep(8);
                 }
-                currentX = (int)Math.Round(fromX + deltaX * i / steps);
-                currentY = (int)Math.Round(fromY + deltaY * i / steps);
-                if (!SetCursorPos(currentX, currentY)) {
-                    throw new System.ComponentModel.Win32Exception(
-                        Marshal.GetLastWin32Error(),
-                        "SetCursorPos failed during drag"
-                    );
-                }
-                System.Threading.Thread.Sleep(8);
             }
         }
         finally {
-            SendMouseButton(LEFTUP);
+            if (buttonDown) {
+                SendMouseButton(up);
+                System.Threading.Thread.Sleep(75);
+            }
         }
     }
 }
@@ -473,41 +575,67 @@ function Send-MouseClick([IntPtr]$hwnd, [int]$screenX, [int]$screenY, [string]$b
     }
 }
 
-function Send-Drag([IntPtr]$hwnd, [int]$fromX, [int]$fromY, [int]$toX, [int]$toY) {
+function Get-OperationScreenPoint($operation, $windowBounds) {
+    if ($null -ne $operation.element -and $null -ne $operation.element.frame) {
+        return Get-ScreenPoint $operation.element.frame $windowBounds
+    }
+    if ($null -eq $operation.x -or $null -eq $operation.y -or $null -eq $windowBounds) {
+        throw "Pointer action requires element_index or x/y coordinates from the latest snapshot"
+    }
+    [pscustomobject]@{
+        x = [int][math]::Round($windowBounds.x + [double]$operation.x)
+        y = [int][math]::Round($windowBounds.y + [double]$operation.y)
+    }
+}
+
+function Initialize-PhysicalPointerTarget([IntPtr]$hwnd, [int]$screenX, [int]$screenY, [bool]$focusChild) {
     if ($hwnd -eq [IntPtr]::Zero) {
-        throw "Cannot drag because the target app has no top-level window"
+        throw "Cannot use physical pointer input because the target app has no top-level window"
     }
     if ([OCUWin32]::IsIconic($hwnd)) {
         [void][OCUWin32]::ShowWindow($hwnd, 9)
     }
     if (-not [OCUWin32]::ActivateWindow($hwnd)) {
-        throw "Cannot drag because Windows refused to activate the target app"
+        throw "Cannot use physical pointer input because Windows refused to activate the target app"
     }
     Start-Sleep -Milliseconds 250
     if ([OCUWin32]::GetForegroundWindow() -ne $hwnd) {
-        throw "Cannot drag because the target app did not remain in the foreground"
+        throw "Cannot use physical pointer input because the target app did not remain in the foreground"
     }
-    if (-not [OCUWin32]::FocusWindowAtPoint($hwnd, $fromX, $fromY)) {
-        throw "Cannot drag because the start point is not over the target app"
+    if (-not [OCUWin32]::IsPointOverWindow($hwnd, $screenX, $screenY)) {
+        throw "Cannot use physical pointer input because the requested point is not over the target app"
     }
-    [OCUWin32]::SendMouseDrag($hwnd, $fromX, $fromY, $toX, $toY)
+    if ($focusChild -and -not [OCUWin32]::FocusWindowAtPoint($hwnd, $screenX, $screenY)) {
+        throw "Cannot focus the target child window for physical pointer input"
+    }
 }
 
-function Send-Scroll([IntPtr]$hwnd, [int]$screenX, [int]$screenY, [string]$direction, [double]$pages) {
-    $point = New-Object OCUWin32+POINT
-    $point.X = $screenX
-    $point.Y = $screenY
-    [void][OCUWin32]::ScreenToClient($hwnd, [ref]$point)
-    $lParam = ConvertTo-LParam $point.X $point.Y
+function Send-PhysicalClick([IntPtr]$hwnd, [int]$screenX, [int]$screenY, [string]$button, [int]$count) {
+    Initialize-PhysicalPointerTarget $hwnd $screenX $screenY $true
+    [OCUWin32]::SendMouseClick($hwnd, $screenX, $screenY, $button, $count)
+}
+
+function Send-Hover([IntPtr]$hwnd, [int]$screenX, [int]$screenY) {
+    Initialize-PhysicalPointerTarget $hwnd $screenX $screenY $false
+    [OCUWin32]::SendMouseMove($hwnd, $screenX, $screenY)
+}
+
+function Send-Drag([IntPtr]$hwnd, [int[]]$coordinates, [string]$button) {
+    if ($null -eq $coordinates -or $coordinates.Length -lt 4) {
+        throw "Cannot drag without at least two coordinate pairs"
+    }
+    Initialize-PhysicalPointerTarget $hwnd $coordinates[0] $coordinates[1] $true
+    [OCUWin32]::SendMouseDrag($hwnd, $coordinates, $button)
+}
+
+function Send-PhysicalScroll([IntPtr]$hwnd, [int]$screenX, [int]$screenY, [string]$direction, [double]$pages) {
+    Initialize-PhysicalPointerTarget $hwnd $screenX $screenY $false
     $delta = [int][math]::Round(120 * $pages)
-    $message = $WM_MOUSEWHEEL
-    if ($direction -eq "down" -or $direction -eq "right") {
+    $horizontal = $direction -eq "left" -or $direction -eq "right"
+    if ($direction -eq "down" -or $direction -eq "left") {
         $delta = -1 * $delta
     }
-    if ($direction -eq "left" -or $direction -eq "right") {
-        $message = $WM_MOUSEHWHEEL
-    }
-    [void][OCUWin32]::PostMessage($hwnd, $message, (ConvertTo-WheelWParam $delta), $lParam)
+    [OCUWin32]::SendMouseWheel($hwnd, $screenX, $screenY, $delta, $horizontal)
 }
 
 function Send-Text([IntPtr]$hwnd, [string]$text) {
@@ -1237,18 +1365,22 @@ function Invoke-Scroll($element, [string]$direction, [double]$pages) {
     if ($null -eq $scroll) {
         return $false
     }
-    $horizontal = [Windows.Automation.ScrollAmount]::NoAmount
-    $vertical = [Windows.Automation.ScrollAmount]::NoAmount
-    if ($direction -eq "up") { $vertical = [Windows.Automation.ScrollAmount]::LargeDecrement }
-    elseif ($direction -eq "down") { $vertical = [Windows.Automation.ScrollAmount]::LargeIncrement }
-    elseif ($direction -eq "left") { $horizontal = [Windows.Automation.ScrollAmount]::LargeDecrement }
-    elseif ($direction -eq "right") { $horizontal = [Windows.Automation.ScrollAmount]::LargeIncrement }
-    $repeat = [math]::Max(1, [int][math]::Ceiling($pages))
-    for ($i = 0; $i -lt $repeat; $i++) {
-        $scroll.Scroll($horizontal, $vertical)
-        Start-Sleep -Milliseconds 40
+    try {
+        $horizontal = [Windows.Automation.ScrollAmount]::NoAmount
+        $vertical = [Windows.Automation.ScrollAmount]::NoAmount
+        if ($direction -eq "up") { $vertical = [Windows.Automation.ScrollAmount]::LargeDecrement }
+        elseif ($direction -eq "down") { $vertical = [Windows.Automation.ScrollAmount]::LargeIncrement }
+        elseif ($direction -eq "left") { $horizontal = [Windows.Automation.ScrollAmount]::LargeDecrement }
+        elseif ($direction -eq "right") { $horizontal = [Windows.Automation.ScrollAmount]::LargeIncrement }
+        $repeat = [math]::Max(1, [int][math]::Ceiling($pages))
+        for ($i = 0; $i -lt $repeat; $i++) {
+            $scroll.Scroll($horizontal, $vertical)
+            Start-Sleep -Milliseconds 40
+        }
+        return $true
+    } catch {
+        return $false
     }
-    return $true
 }
 
 function Find-TextEntryElement($process) {
@@ -1406,42 +1538,36 @@ try {
                         throw "click_method 'accessibility' could not click the requested element"
                     }
                 } elseif ($clickMethod -eq "app_post") {
-                    if ($null -ne $operation.element -and $null -ne $operation.element.frame) {
-                        $point = Get-ScreenPoint $operation.element.frame $windowBounds
-                    } else {
-                        $point = [pscustomobject]@{
-                            x = [int][math]::Round($windowBounds.x + [double]$operation.x)
-                            y = [int][math]::Round($windowBounds.y + [double]$operation.y)
-                        }
-                    }
+                    $point = Get-OperationScreenPoint $operation $windowBounds
                     $clickHwnd = Get-ClickWindowHandle $element $operation.element $hwnd
                     Send-MouseClick $clickHwnd $point.x $point.y $operation.mouse_button ([int]$operation.click_count)
                 } elseif ($clickMethod -eq "global") {
-                    throw "click_method 'global' is not supported on Windows"
+                    $point = Get-OperationScreenPoint $operation $windowBounds
+                    Send-PhysicalClick $hwnd $point.x $point.y $operation.mouse_button ([int]$operation.click_count)
                 } elseif ($clickMethod -eq "sky_click") {
                     throw "click_method 'sky_click' is not supported on Windows"
                 } elseif ($clickMethod -eq "auto") {
                     $handled = $false
-                    if ($null -ne $element -and $operation.mouse_button -ne "right" -and $operation.mouse_button -ne "middle") {
-                        $handled = Invoke-PreferredClick $element
-                    } elseif ($null -eq $element -and $operation.mouse_button -ne "right" -and $operation.mouse_button -ne "middle") {
-                        $handled = Invoke-MsaaElement $operation.element
+                    try {
+                        if ($operation.mouse_button -eq "left" -and [int]$operation.click_count -eq 1 -and $null -ne $element) {
+                            $handled = Invoke-PreferredClick $element
+                        } elseif ($operation.mouse_button -eq "left" -and [int]$operation.click_count -eq 1 -and $null -eq $element) {
+                            $handled = Invoke-MsaaElement $operation.element
+                        }
+                    } catch {
+                        $handled = $false
                     }
                     if (-not $handled) {
-                        if ($null -ne $operation.element -and $null -ne $operation.element.frame) {
-                            $point = Get-ScreenPoint $operation.element.frame $windowBounds
-                        } else {
-                            $point = [pscustomobject]@{
-                                x = [int][math]::Round($windowBounds.x + [double]$operation.x)
-                                y = [int][math]::Round($windowBounds.y + [double]$operation.y)
-                            }
-                        }
-                        $clickHwnd = Get-ClickWindowHandle $element $operation.element $hwnd
-                        Send-MouseClick $clickHwnd $point.x $point.y $operation.mouse_button ([int]$operation.click_count)
+                        $point = Get-OperationScreenPoint $operation $windowBounds
+                        Send-PhysicalClick $hwnd $point.x $point.y $operation.mouse_button ([int]$operation.click_count)
                     }
                 } else {
                     throw "Invalid click_method '$clickMethod'"
                 }
+            }
+            "hover" {
+                $point = Get-OperationScreenPoint $operation $windowBounds
+                Send-Hover $hwnd $point.x $point.y
             }
             "perform_secondary_action" {
                 if ($null -eq $element -and $operation.action.ToLowerInvariant() -eq "invoke" -and (Invoke-MsaaElement $operation.element)) {
@@ -1456,12 +1582,28 @@ try {
                     $handled = Invoke-Scroll $element $operation.direction ([double]$operation.pages)
                 }
                 if (-not $handled) {
-                    $point = Get-ScreenPoint $operation.element.frame $windowBounds
-                    Send-Scroll $hwnd $point.x $point.y $operation.direction ([double]$operation.pages)
+                    $localFrame = $operation.element.frame
+                    if ($null -eq $localFrame -and $null -ne $element) {
+                        $localFrame = Get-LocalFrame $element $windowBounds
+                    }
+                    $point = Get-ScreenPoint $localFrame $windowBounds
+                    if ($null -eq $point) {
+                        throw "Cannot physically scroll an element without a visible frame"
+                    }
+                    Send-PhysicalScroll $hwnd $point.x $point.y $operation.direction ([double]$operation.pages)
                 }
             }
             "drag" {
-                Send-Drag $hwnd ([int][math]::Round($windowBounds.x + [double]$operation.from_x)) ([int][math]::Round($windowBounds.y + [double]$operation.from_y)) ([int][math]::Round($windowBounds.x + [double]$operation.to_x)) ([int][math]::Round($windowBounds.y + [double]$operation.to_y))
+                $coordinates = New-Object System.Collections.Generic.List[int]
+                $coordinates.Add([int][math]::Round($windowBounds.x + [double]$operation.from_x))
+                $coordinates.Add([int][math]::Round($windowBounds.y + [double]$operation.from_y))
+                foreach ($pathPoint in @($operation.path)) {
+                    $coordinates.Add([int][math]::Round($windowBounds.x + [double]$pathPoint.x))
+                    $coordinates.Add([int][math]::Round($windowBounds.y + [double]$pathPoint.y))
+                }
+                $coordinates.Add([int][math]::Round($windowBounds.x + [double]$operation.to_x))
+                $coordinates.Add([int][math]::Round($windowBounds.y + [double]$operation.to_y))
+                Send-Drag $hwnd ($coordinates.ToArray()) $operation.mouse_button
             }
             "type_text" {
                 if (-not (Invoke-TypeText $process $operation.text)) {
