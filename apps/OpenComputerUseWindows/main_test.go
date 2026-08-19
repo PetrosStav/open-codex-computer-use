@@ -255,8 +255,11 @@ func TestWindowsRuntimeForegroundActionsRequireOptIn(t *testing.T) {
 	if !strings.Contains(serverInstructions, "does not auto-launch apps, perform SetFocus, or use UIA text fallback by default") {
 		t.Fatal("MCP instructions must document the Windows background-focus policy")
 	}
-	if !strings.Contains(serverInstructions, "press_key activates the app's active window before sending input") {
-		t.Fatal("MCP instructions must document that Windows press_key activates the target app's active window")
+	if !strings.Contains(serverInstructions, "press_key and drag tools are different") {
+		t.Fatal("MCP instructions must document that Windows press_key and drag activate the target app")
+	}
+	if !strings.Contains(serverInstructions, "drag also moves the real mouse pointer") {
+		t.Fatal("MCP instructions must document the Windows drag pointer side effect")
 	}
 }
 
@@ -369,6 +372,47 @@ func TestWindowsNavigationKeysUseExtendedKeyFlag(t *testing.T) {
 		if !strings.Contains(windowsRuntimeScript, fragment) {
 			t.Fatalf("Windows extended-key runtime missing %q", fragment)
 		}
+	}
+}
+
+func TestWindowsDragUsesForegroundSystemInput(t *testing.T) {
+	for _, fragment := range []string{
+		"public static extern int SetProcessDpiAwareness",
+		"[OCUWin32]::SetProcessDpiAwareness(2)",
+		"public static extern bool IsIconic",
+		"public static extern bool SetCursorPos",
+		"public static extern short GetAsyncKeyState",
+		"public static bool FocusWindowAtPoint",
+		"WindowFromPoint(point)",
+		"GetAncestor(child, 2) != target",
+		"AttachThreadInput(currentThread, childThread, true)",
+		"public static bool IsPointOverWindow",
+		"public static void SendMouseDrag(IntPtr target",
+		"Target app lost foreground or no longer covers the drag start point",
+		"Target app lost foreground during drag",
+		"System.Threading.Thread.Sleep(150)",
+		"System.Threading.Thread.Sleep(75)",
+		"SendMouseButton(LEFTDOWN)",
+		"SendMouseButton(LEFTUP)",
+		"[OCUWin32]::ActivateWindow($hwnd)",
+		"if (-not [OCUWin32]::FocusWindowAtPoint($hwnd, $fromX, $fromY))",
+		"[OCUWin32]::SendMouseDrag($hwnd, $fromX, $fromY, $toX, $toY)",
+	} {
+		if !strings.Contains(windowsRuntimeScript, fragment) {
+			t.Fatalf("Windows physical drag runtime missing %q", fragment)
+		}
+	}
+
+	start := strings.Index(windowsRuntimeScript, "function Send-Drag")
+	if start < 0 {
+		t.Fatal("could not locate Send-Drag function")
+	}
+	end := strings.Index(windowsRuntimeScript[start:], "function Send-Scroll")
+	if end < 0 {
+		t.Fatal("could not locate end of Send-Drag function")
+	}
+	if strings.Contains(windowsRuntimeScript[start:start+end], "PostMessage") {
+		t.Fatal("Send-Drag must not post synthetic parent-window mouse messages")
 	}
 }
 

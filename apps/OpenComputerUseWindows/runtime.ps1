@@ -21,6 +21,9 @@ using System;
 using System.Runtime.InteropServices;
 
 public static class OCUWin32 {
+    [DllImport("shcore.dll")]
+    public static extern int SetProcessDpiAwareness(int awareness);
+
     [StructLayout(LayoutKind.Sequential)]
     public struct RECT {
         public int Left;
@@ -148,6 +151,24 @@ public static class OCUWin32 {
     public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 
     [DllImport("user32.dll")]
+    public static extern bool IsIconic(IntPtr hWnd);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool SetCursorPos(int x, int y);
+
+    [DllImport("user32.dll")]
+    public static extern short GetAsyncKeyState(int virtualKey);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr WindowFromPoint(POINT point);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr SetFocus(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetAncestor(IntPtr hWnd, uint flags);
+
+    [DllImport("user32.dll")]
     public static extern IntPtr GetForegroundWindow();
 
     public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
@@ -239,8 +260,107 @@ public static class OCUWin32 {
             }
         }
     }
+
+    public static bool FocusWindowAtPoint(IntPtr target, int x, int y) {
+        POINT point = new POINT();
+        point.X = x;
+        point.Y = y;
+        IntPtr child = WindowFromPoint(point);
+        uint targetProcess;
+        uint childProcess;
+        GetWindowThreadProcessId(target, out targetProcess);
+        uint childThread = GetWindowThreadProcessId(child, out childProcess);
+        if (child == IntPtr.Zero || childProcess != targetProcess || GetAncestor(child, 2) != target) {
+            return false;
+        }
+
+        uint currentThread = GetCurrentThreadId();
+        bool attached = childThread != 0 && childThread != currentThread &&
+            AttachThreadInput(currentThread, childThread, true);
+        try {
+            SetFocus(child);
+            return true;
+        }
+        finally {
+            if (attached) {
+                AttachThreadInput(currentThread, childThread, false);
+            }
+        }
+    }
+
+    public static bool IsPointOverWindow(IntPtr target, int x, int y) {
+        POINT point = new POINT();
+        point.X = x;
+        point.Y = y;
+        IntPtr child = WindowFromPoint(point);
+        return child != IntPtr.Zero && GetAncestor(child, 2) == target;
+    }
+
+    private static void SendMouseButton(uint flags) {
+        INPUT input = new INPUT();
+        input.type = 0;
+        input.union.mi.dwFlags = flags;
+        INPUT[] inputs = new INPUT[] { input };
+        uint sent = SendInput(1, inputs, Marshal.SizeOf(typeof(INPUT)));
+        if (sent != 1) {
+            throw new System.ComponentModel.Win32Exception(
+                Marshal.GetLastWin32Error(),
+                "SendInput mouse event failed"
+            );
+        }
+    }
+
+    public static void SendMouseDrag(IntPtr target, int fromX, int fromY, int toX, int toY) {
+        const uint LEFTDOWN = 0x0002;
+        const uint LEFTUP = 0x0004;
+        double deltaX = toX - fromX;
+        double deltaY = toY - fromY;
+        double distance = Math.Sqrt(deltaX * deltaX + deltaY * deltaY);
+        int steps = Math.Min(240, Math.Max(12, (int)Math.Ceiling(distance / 8.0)));
+        int currentX = fromX;
+        int currentY = fromY;
+
+        if (!SetCursorPos(fromX, fromY)) {
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "SetCursorPos failed");
+        }
+        System.Threading.Thread.Sleep(150);
+        if (GetForegroundWindow() != target || !IsPointOverWindow(target, fromX, fromY)) {
+            throw new InvalidOperationException("Target app lost foreground or no longer covers the drag start point");
+        }
+        SendMouseButton(LEFTDOWN);
+        try {
+            System.Threading.Thread.Sleep(75);
+            if ((GetAsyncKeyState(0x01) & 0x8000) == 0) {
+                throw new InvalidOperationException("Injected left button did not enter the down state");
+            }
+            if (GetForegroundWindow() != target) {
+                throw new InvalidOperationException("Target app lost foreground during drag");
+            }
+            for (int i = 1; i <= steps; i++) {
+                if (GetForegroundWindow() != target) {
+                    throw new InvalidOperationException("Target app lost foreground during drag");
+                }
+                currentX = (int)Math.Round(fromX + deltaX * i / steps);
+                currentY = (int)Math.Round(fromY + deltaY * i / steps);
+                if (!SetCursorPos(currentX, currentY)) {
+                    throw new System.ComponentModel.Win32Exception(
+                        Marshal.GetLastWin32Error(),
+                        "SetCursorPos failed during drag"
+                    );
+                }
+                System.Threading.Thread.Sleep(8);
+            }
+        }
+        finally {
+            SendMouseButton(LEFTUP);
+        }
+    }
 }
 "@
+
+# UI Automation exposes physical screen coordinates. Keep Win32 hit testing and
+# cursor placement in that same coordinate space on mixed-DPI desktops.
+[void][OCUWin32]::SetProcessDpiAwareness(2)
 
 $WM_SETTEXT = 0x000C
 $WM_MOUSEMOVE = 0x0200
@@ -354,26 +474,23 @@ function Send-MouseClick([IntPtr]$hwnd, [int]$screenX, [int]$screenY, [string]$b
 }
 
 function Send-Drag([IntPtr]$hwnd, [int]$fromX, [int]$fromY, [int]$toX, [int]$toY) {
-    $start = New-Object OCUWin32+POINT
-    $start.X = $fromX
-    $start.Y = $fromY
-    [void][OCUWin32]::ScreenToClient($hwnd, [ref]$start)
-    $end = New-Object OCUWin32+POINT
-    $end.X = $toX
-    $end.Y = $toY
-    [void][OCUWin32]::ScreenToClient($hwnd, [ref]$end)
-
-    $steps = 12
-    $startParam = ConvertTo-LParam $start.X $start.Y
-    [void][OCUWin32]::PostMessage($hwnd, $WM_MOUSEMOVE, [IntPtr]::Zero, $startParam)
-    [void][OCUWin32]::PostMessage($hwnd, $WM_LBUTTONDOWN, [IntPtr]1, $startParam)
-    for ($i = 1; $i -le $steps; $i++) {
-        $x = [int][math]::Round($start.X + (($end.X - $start.X) * $i / $steps))
-        $y = [int][math]::Round($start.Y + (($end.Y - $start.Y) * $i / $steps))
-        [void][OCUWin32]::PostMessage($hwnd, $WM_MOUSEMOVE, [IntPtr]1, (ConvertTo-LParam $x $y))
-        Start-Sleep -Milliseconds 20
+    if ($hwnd -eq [IntPtr]::Zero) {
+        throw "Cannot drag because the target app has no top-level window"
     }
-    [void][OCUWin32]::PostMessage($hwnd, $WM_LBUTTONUP, [IntPtr]::Zero, (ConvertTo-LParam $end.X $end.Y))
+    if ([OCUWin32]::IsIconic($hwnd)) {
+        [void][OCUWin32]::ShowWindow($hwnd, 9)
+    }
+    if (-not [OCUWin32]::ActivateWindow($hwnd)) {
+        throw "Cannot drag because Windows refused to activate the target app"
+    }
+    Start-Sleep -Milliseconds 250
+    if ([OCUWin32]::GetForegroundWindow() -ne $hwnd) {
+        throw "Cannot drag because the target app did not remain in the foreground"
+    }
+    if (-not [OCUWin32]::FocusWindowAtPoint($hwnd, $fromX, $fromY)) {
+        throw "Cannot drag because the start point is not over the target app"
+    }
+    [OCUWin32]::SendMouseDrag($hwnd, $fromX, $fromY, $toX, $toY)
 }
 
 function Send-Scroll([IntPtr]$hwnd, [int]$screenX, [int]$screenY, [string]$direction, [double]$pages) {
@@ -478,7 +595,9 @@ function Send-Key([IntPtr]$hwnd, [string]$key) {
         throw "Cannot press a key because the target app has no top-level window"
     }
 
-    [void][OCUWin32]::ShowWindow($hwnd, 9)
+    if ([OCUWin32]::IsIconic($hwnd)) {
+        [void][OCUWin32]::ShowWindow($hwnd, 9)
+    }
     if (-not [OCUWin32]::ActivateWindow($hwnd)) {
         throw "Cannot press a key because Windows refused to activate the target app"
     }
