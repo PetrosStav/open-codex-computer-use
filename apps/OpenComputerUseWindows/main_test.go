@@ -255,6 +255,86 @@ func TestWindowsRuntimeForegroundActionsRequireOptIn(t *testing.T) {
 	if !strings.Contains(serverInstructions, "does not auto-launch apps, perform SetFocus, or use UIA text fallback by default") {
 		t.Fatal("MCP instructions must document the Windows background-focus policy")
 	}
+	if !strings.Contains(serverInstructions, "press_key activates the app's active window before sending input") {
+		t.Fatal("MCP instructions must document that Windows press_key activates the target app's active window")
+	}
+}
+
+func TestWindowsPressKeyUsesSystemInput(t *testing.T) {
+	for _, fragment := range []string{
+		"[StructLayout(LayoutKind.Explicit)]",
+		"[FieldOffset(0)] public MOUSEINPUT mi;",
+		"[FieldOffset(0)] public KEYBDINPUT ki;",
+		"public static extern uint SendInput",
+		"public static void SendKeySequence",
+		"public static bool ActivateWindow",
+		"AttachThreadInput(currentThread, foregroundThread, true)",
+		"AttachThreadInput(currentThread, targetThread, true)",
+		"[OCUWin32]::ActivateWindow($hwnd)",
+		"[OCUWin32]::SendKeySequence",
+		`"ctrl" = 0x11`,
+		`"shift" = 0x10`,
+		`"alt" = 0x12`,
+		`"win" = 0x5B`,
+	} {
+		if !strings.Contains(windowsRuntimeScript, fragment) {
+			t.Fatalf("Windows press_key runtime missing %q", fragment)
+		}
+	}
+
+	start := strings.Index(windowsRuntimeScript, "function Send-Key")
+	if start < 0 {
+		t.Fatal("could not locate Send-Key function")
+	}
+	end := strings.Index(windowsRuntimeScript[start:], "function Resolve-App")
+	if end < 0 {
+		t.Fatal("could not locate end of Send-Key function")
+	}
+	if strings.Contains(windowsRuntimeScript[start:start+end], "PostMessage") {
+		t.Fatal("Send-Key must not post synthetic WM_KEYDOWN/WM_KEYUP messages")
+	}
+}
+
+func TestWindowsRuntimeTargetsActiveModalWindow(t *testing.T) {
+	for _, fragment := range []string{
+		"public static IntPtr ResolveActionWindow",
+		"foregroundProcessId == processId",
+		"IsWindowVisible(mainWindow) && IsWindowEnabled(mainWindow)",
+		"EnumWindows(delegate(IntPtr window",
+		"$hwnd = [OCUWin32]::ResolveActionWindow",
+		"$latestElement = Get-MainElement $process",
+		"Get-NativeWindowHandle $latestElement",
+	} {
+		if !strings.Contains(windowsRuntimeScript, fragment) {
+			t.Fatalf("Windows modal routing runtime missing %q", fragment)
+		}
+	}
+}
+
+func TestWindowsRuntimePreservesFocusedTextSelection(t *testing.T) {
+	for _, fragment := range []string{
+		"$hasKeyboardFocus = [bool]$element.Current.HasKeyboardFocus",
+		"if (-not $hasKeyboardFocus)",
+		"Test-TextWindowHandleCandidate $process $focused",
+	} {
+		if !strings.Contains(windowsRuntimeScript, fragment) {
+			t.Fatalf("Windows focused text entry runtime missing %q", fragment)
+		}
+	}
+}
+
+func TestWindowsNavigationKeysUseExtendedKeyFlag(t *testing.T) {
+	for _, fragment := range []string{
+		"private static bool IsExtendedKey",
+		"case 0x23: // End",
+		"case 0x24: // Home",
+		"case 0x2D: // Insert",
+		"uint flags = IsExtendedKey(virtualKey) ? 1u : 0u",
+	} {
+		if !strings.Contains(windowsRuntimeScript, fragment) {
+			t.Fatalf("Windows extended-key runtime missing %q", fragment)
+		}
+	}
 }
 
 func TestUTF8EncodingInPowerShellScript(t *testing.T) {

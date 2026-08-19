@@ -35,6 +35,37 @@ public static class OCUWin32 {
         public int Y;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    public struct KEYBDINPUT {
+        public ushort wVk;
+        public ushort wScan;
+        public uint dwFlags;
+        public uint time;
+        public IntPtr dwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MOUSEINPUT {
+        public int dx;
+        public int dy;
+        public uint mouseData;
+        public uint dwFlags;
+        public uint time;
+        public IntPtr dwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Explicit)]
+    public struct InputUnion {
+        [FieldOffset(0)] public MOUSEINPUT mi;
+        [FieldOffset(0)] public KEYBDINPUT ki;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct INPUT {
+        public uint type;
+        public InputUnion union;
+    }
+
     [DllImport("user32.dll")]
     public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
 
@@ -49,6 +80,147 @@ public static class OCUWin32 {
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern IntPtr SendMessage(IntPtr hWnd, UInt32 msg, IntPtr wParam, string lParam);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+
+    private static INPUT KeyboardInput(ushort virtualKey, uint flags) {
+        INPUT input = new INPUT();
+        input.type = 1;
+        input.union.ki.wVk = virtualKey;
+        input.union.ki.dwFlags = flags;
+        return input;
+    }
+
+    private static bool IsExtendedKey(ushort virtualKey) {
+        switch (virtualKey) {
+            case 0x21: // Page Up
+            case 0x22: // Page Down
+            case 0x23: // End
+            case 0x24: // Home
+            case 0x25: // Left
+            case 0x26: // Up
+            case 0x27: // Right
+            case 0x28: // Down
+            case 0x2D: // Insert
+            case 0x2E: // Delete
+            case 0x5B: // Left Windows
+            case 0x5C: // Right Windows
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private static INPUT KeyEvent(ushort virtualKey, bool keyUp) {
+        uint flags = IsExtendedKey(virtualKey) ? 1u : 0u;
+        if (keyUp) {
+            flags |= 2u;
+        }
+        return KeyboardInput(virtualKey, flags);
+    }
+
+    public static void SendKeySequence(ushort[] modifiers, ushort virtualKey) {
+        INPUT[] inputs = new INPUT[modifiers.Length * 2 + 2];
+        int index = 0;
+        foreach (ushort modifier in modifiers) {
+            inputs[index++] = KeyEvent(modifier, false);
+        }
+        inputs[index++] = KeyEvent(virtualKey, false);
+        inputs[index++] = KeyEvent(virtualKey, true);
+        for (int i = modifiers.Length - 1; i >= 0; i--) {
+            inputs[index++] = KeyEvent(modifiers[i], true);
+        }
+
+        uint sent = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
+        if (sent != inputs.Length) {
+            throw new System.ComponentModel.Win32Exception(
+                Marshal.GetLastWin32Error(),
+                "SendInput sent " + sent + " of " + inputs.Length + " keyboard events"
+            );
+        }
+    }
+
+    [DllImport("user32.dll")]
+    public static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsWindowEnabled(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+    [DllImport("kernel32.dll")]
+    public static extern uint GetCurrentThreadId();
+
+    [DllImport("user32.dll")]
+    public static extern bool AttachThreadInput(uint attach, uint attachTo, bool value);
+
+    public static IntPtr ResolveActionWindow(uint processId, IntPtr mainWindow) {
+        IntPtr foreground = GetForegroundWindow();
+        uint foregroundProcessId;
+        GetWindowThreadProcessId(foreground, out foregroundProcessId);
+        if (foregroundProcessId == processId && IsWindowVisible(foreground) && IsWindowEnabled(foreground)) {
+            return foreground;
+        }
+
+        if (mainWindow != IntPtr.Zero && IsWindowVisible(mainWindow) && IsWindowEnabled(mainWindow)) {
+            return mainWindow;
+        }
+
+        IntPtr candidate = IntPtr.Zero;
+        EnumWindows(delegate(IntPtr window, IntPtr ignored) {
+            uint windowProcessId;
+            GetWindowThreadProcessId(window, out windowProcessId);
+            if (windowProcessId == processId && IsWindowVisible(window) && IsWindowEnabled(window)) {
+                candidate = window;
+                return false;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return candidate != IntPtr.Zero ? candidate : mainWindow;
+    }
+
+    public static bool ActivateWindow(IntPtr target) {
+        IntPtr foreground = GetForegroundWindow();
+        if (foreground == target) {
+            return true;
+        }
+
+        uint ignored;
+        uint currentThread = GetCurrentThreadId();
+        uint foregroundThread = GetWindowThreadProcessId(foreground, out ignored);
+        uint targetThread = GetWindowThreadProcessId(target, out ignored);
+        bool foregroundAttached = foregroundThread != 0 && foregroundThread != currentThread &&
+            AttachThreadInput(currentThread, foregroundThread, true);
+        bool targetAttached = targetThread != 0 && targetThread != currentThread && targetThread != foregroundThread &&
+            AttachThreadInput(currentThread, targetThread, true);
+        try {
+            return SetForegroundWindow(target);
+        }
+        finally {
+            if (targetAttached) {
+                AttachThreadInput(currentThread, targetThread, false);
+            }
+            if (foregroundAttached) {
+                AttachThreadInput(currentThread, foregroundThread, false);
+            }
+        }
+    }
 }
 "@
 
@@ -215,7 +387,11 @@ function Send-TextToEditHandle([IntPtr]$hwnd, [string]$text, $element) {
     }
 
     try {
-        [void][OCUWin32]::SendMessage($hwnd, $EM_SETSEL, [IntPtr](-1), [IntPtr](-1))
+        $hasKeyboardFocus = $false
+        try { $hasKeyboardFocus = [bool]$element.Current.HasKeyboardFocus } catch {}
+        if (-not $hasKeyboardFocus) {
+            [void][OCUWin32]::SendMessage($hwnd, $EM_SETSEL, [IntPtr](-1), [IntPtr](-1))
+        }
         [void][OCUWin32]::SendMessage($hwnd, $EM_REPLACESEL, [IntPtr]1, $text)
         return $true
     } catch {
@@ -240,6 +416,9 @@ function Get-VirtualKey([string]$key) {
         "backspace" = 0x08; "back_space" = 0x08; "delete" = 0x2E; "space" = 0x20
         "left" = 0x25; "up" = 0x26; "right" = 0x27; "down" = 0x28
         "home" = 0x24; "end" = 0x23; "page_up" = 0x21; "prior" = 0x21; "page_down" = 0x22; "next" = 0x22
+        "insert" = 0x2D
+        "ctrl" = 0x11; "control" = 0x11; "shift" = 0x10; "alt" = 0x12
+        "win" = 0x5B; "super" = 0x5B; "cmd" = 0x5B
     }
     if ($map.ContainsKey($normalized)) {
         return $map[$normalized]
@@ -272,19 +451,24 @@ function Send-Key([IntPtr]$hwnd, [string]$key) {
             "super" { $modifiers += 0x5B }
             "win" { $modifiers += 0x5B }
             "cmd" { $modifiers += 0x5B }
+            default { throw "Unsupported modifier: $($parts[$i])" }
         }
     }
-    foreach ($modifier in $modifiers) {
-        [void][OCUWin32]::PostMessage($hwnd, $WM_KEYDOWN, [IntPtr]$modifier, [IntPtr]::Zero)
+
+    if ($hwnd -eq [IntPtr]::Zero) {
+        throw "Cannot press a key because the target app has no top-level window"
     }
-    $vk = Get-VirtualKey $main
-    [void][OCUWin32]::PostMessage($hwnd, $WM_KEYDOWN, [IntPtr]$vk, [IntPtr]::Zero)
-    Start-Sleep -Milliseconds 25
-    [void][OCUWin32]::PostMessage($hwnd, $WM_KEYUP, [IntPtr]$vk, [IntPtr]::Zero)
-    [array]::Reverse($modifiers)
-    foreach ($modifier in $modifiers) {
-        [void][OCUWin32]::PostMessage($hwnd, $WM_KEYUP, [IntPtr]$modifier, [IntPtr]::Zero)
+
+    [void][OCUWin32]::ShowWindow($hwnd, 9)
+    if (-not [OCUWin32]::ActivateWindow($hwnd)) {
+        throw "Cannot press a key because Windows refused to activate the target app"
     }
+    Start-Sleep -Milliseconds 300
+    if ([OCUWin32]::GetForegroundWindow() -ne $hwnd) {
+        throw "Cannot press a key because the target app did not remain in the foreground"
+    }
+
+    [OCUWin32]::SendKeySequence([System.UInt16[]]$modifiers, [System.UInt16](Get-VirtualKey $main))
 }
 
 function Resolve-App([string]$query) {
@@ -330,8 +514,9 @@ function Resolve-App([string]$query) {
 }
 
 function Get-MainElement($process) {
-    if ($process.MainWindowHandle -ne 0) {
-        return [Windows.Automation.AutomationElement]::FromHandle([IntPtr]$process.MainWindowHandle)
+    $hwnd = [OCUWin32]::ResolveActionWindow([uint32]$process.Id, [IntPtr]$process.MainWindowHandle)
+    if ($hwnd -ne [IntPtr]::Zero) {
+        return [Windows.Automation.AutomationElement]::FromHandle($hwnd)
     }
     $condition = New-Object Windows.Automation.PropertyCondition ([Windows.Automation.AutomationElement]::ProcessIdProperty), $process.Id
     $children = [Windows.Automation.AutomationElement]::RootElement.FindAll([Windows.Automation.TreeScope]::Children, $condition)
@@ -342,7 +527,10 @@ function Get-MainElement($process) {
 }
 
 function Get-WindowBounds($process, $element) {
-    $hwnd = [IntPtr]$process.MainWindowHandle
+    $hwnd = Get-NativeWindowHandle $element
+    if ($hwnd -eq [IntPtr]::Zero) {
+        $hwnd = [IntPtr]$process.MainWindowHandle
+    }
     if ($hwnd -ne [IntPtr]::Zero) {
         $fromWin32 = Get-WindowRectFrame $hwnd
         if ($null -ne $fromWin32) {
@@ -620,15 +808,25 @@ function Build-Snapshot([string]$query, $TextLimit = $script:DefaultTextLimit, [
     $element = Get-MainElement $process
     $bounds = Get-WindowBounds $process $element
     $rendered = Render-Tree $element $bounds $TextLimit $MaxTreeNodes $MaxTreeDepth
+    $screenshot = Capture-WindowPngBase64 $bounds
+
+    # A shortcut can create a modal window while the initial tree is rendering.
+    $latestElement = Get-MainElement $process
+    if ((Get-NativeWindowHandle $latestElement) -ne (Get-NativeWindowHandle $element)) {
+        $element = $latestElement
+        $bounds = Get-WindowBounds $process $element
+        $rendered = Render-Tree $element $bounds $TextLimit $MaxTreeNodes $MaxTreeDepth
+        $screenshot = Capture-WindowPngBase64 $bounds
+    }
     [pscustomobject]@{
         app = [pscustomobject]@{
             name = $process.ProcessName
             bundleIdentifier = $process.ProcessName
             pid = [int]$process.Id
         }
-        windowTitle = Limit-Text $process.MainWindowTitle $TextLimit
+        windowTitle = Limit-Text (Get-ElementString $element "Name") $TextLimit
         windowBounds = $bounds
-        screenshotPngBase64 = Capture-WindowPngBase64 $bounds
+        screenshotPngBase64 = $screenshot
         treeLines = @($rendered.lines)
         focusedSummary = Get-FocusedSummary $process.Id $TextLimit
         selectedText = Get-SelectedText $process.Id $TextLimit
@@ -788,7 +986,7 @@ function Find-TextEntryElement($process) {
         $focused = [Windows.Automation.AutomationElement]::FocusedElement
         if ($null -ne $focused -and $focused.Current.ProcessId -eq $process.Id) {
             $focusedValue = Get-CurrentPatternOrNull $focused ([Windows.Automation.ValuePattern]::Pattern)
-            if ($null -ne $focusedValue -and -not $focusedValue.Current.IsReadOnly) {
+            if (($null -ne $focusedValue -and -not $focusedValue.Current.IsReadOnly) -or (Test-TextWindowHandleCandidate $process $focused)) {
                 return $focused
             }
         }
@@ -905,7 +1103,7 @@ try {
         $response = [pscustomobject]@{ ok = $true; snapshot = (Build-Snapshot $operation.app (Resolve-TextLimit $operation.text_limit) ([int]$operation.max_tree_nodes) ([int]$operation.max_tree_depth)) }
     } else {
         $process = Resolve-App $operation.app
-        $hwnd = [IntPtr]$process.MainWindowHandle
+        $hwnd = [OCUWin32]::ResolveActionWindow([uint32]$process.Id, [IntPtr]$process.MainWindowHandle)
         $windowBounds = $operation.windowBounds
         $element = Find-Element $process $operation.element
 
@@ -994,7 +1192,7 @@ try {
             }
         }
 
-        Start-Sleep -Milliseconds 120
+        Start-Sleep -Milliseconds 300
         $response = [pscustomobject]@{ ok = $true; snapshot = (Build-Snapshot $operation.app) }
     }
 } catch {
